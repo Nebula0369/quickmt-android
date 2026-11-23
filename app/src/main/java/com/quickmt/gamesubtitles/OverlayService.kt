@@ -125,13 +125,13 @@ class OverlayService : Service() {
     private val scanRunnable = object : Runnable {
         override fun run() {
             if (stopped.get()) return
-            val isCover = prefs.overlayMode == OverlayMode.COVER
+            val mode = prefs.overlayMode
+            val isLegacyHide = (mode == OverlayMode.COVER_HIDE)
             val overlayShowing = subtitleView?.visibility == View.VISIBLE && lastEnglishText.isNotEmpty()
 
-            // Fast 250ms scan when no subtitle is on screen (0 flicker!);
-            // Calm adaptive interval (1.8s -> 2.3s) in COVER mode while reading a displayed subtitle!
+            // COVER_DIRECT (Android 14+ Single App) & ABOVE run at FULL 250ms speed with ZERO flicker!
             val nextDelayMs = when {
-                !isCover -> 300L
+                !isLegacyHide -> 250L
                 !overlayShowing -> 250L
                 stableCoverChecks >= 1 -> (prefs.coverCheckIntervalMs + 500L).coerceAtMost(3500L)
                 else -> prefs.coverCheckIntervalMs.toLong()
@@ -140,8 +140,7 @@ class OverlayService : Service() {
             if (!paused.get() && !rotating.get() && pickerView == null &&
                 QuickMTNative.isInitialized && busy.compareAndSet(false, true)
             ) {
-                if (isCover && overlayShowing) {
-                    // Ultra-brief GPU alpha=0 synced to Choreographer VSync (~16-32ms instead of 80ms+)
+                if (isLegacyHide && overlayShowing) {
                     val tv = subtitleView
                     if (tv != null) {
                         tv.alpha = 0f
@@ -166,6 +165,9 @@ class OverlayService : Service() {
                         captureAndProcess(restoreCoverAlpha = false)
                     }
                 } else {
+                    // Never hide overlay! (In Android 14+ Single-App capture, SurfaceFlinger
+                    // automatically excludes TYPE_APPLICATION_OVERLAY just like Windows WDA!)
+                    subtitleView?.alpha = 1f
                     captureAndProcess(restoreCoverAlpha = false)
                 }
             }
@@ -456,7 +458,7 @@ class OverlayService : Service() {
         val centerX = detectedRect.centerX()
         val x = (centerX - targetW / 2).coerceIn(12, max(12, screenW - targetW - 12))
 
-        if (prefs.overlayMode == OverlayMode.COVER) {
+        if (prefs.overlayMode == OverlayMode.COVER_DIRECT || prefs.overlayMode == OverlayMode.COVER_HIDE) {
             val coverH = max(detectedRect.height() + padY * 2, measuredH)
             val centerY = detectedRect.centerY()
             val y = (centerY - coverH / 2).coerceIn(12, max(12, screenH - coverH - 12))
@@ -748,7 +750,7 @@ class OverlayService : Service() {
                 if (!isPlausibleEnglishSubtitle(rawText)) {
                     emptyStreak++
                     stableCoverChecks = 0
-                    val clearAfter = if (prefs.overlayMode == OverlayMode.COVER) 1 else 2
+                    val clearAfter = if (prefs.overlayMode == OverlayMode.COVER_HIDE) 1 else 2
                     if (emptyStreak >= clearAfter && lastEnglishText.isNotEmpty()) {
                         lastEnglishText = ""
                         subtitleView?.visibility = View.GONE

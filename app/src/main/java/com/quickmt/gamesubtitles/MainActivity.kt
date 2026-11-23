@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -155,24 +156,41 @@ class MainActivity : AppCompatActivity() {
         // 2. Overlay Position Mode Card
         val modeCard = makeCard("2. Altyazı Kutu Konumu")
         val radioGroup = RadioGroup(this)
+        val rbCoverDirect = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "Üstünü kapat — Sıfır titreme & Tam hız (Android 14+ 'Tek bir uygulama' seç — Önerilen)"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.overlayMode == OverlayMode.COVER_DIRECT
+        }
         val rbAbove = RadioButton(this).apply {
             id = View.generateViewId()
-            text = "Altyazının hemen üstünde (Sıfır titreme — Önerilen)"
+            text = "Altyazının hemen üstünde (Tüm ekran — Sıfır titreme & Tam hız)"
             setTextColor(Color.WHITE)
             isChecked = prefs.overlayMode == OverlayMode.ABOVE
         }
-        val rbCover = RadioButton(this).apply {
+        val rbCoverHide = RadioButton(this).apply {
             id = View.generateViewId()
-            text = "Orijinal İngilizce altyazının tam üstünü kapat"
-            setTextColor(Color.WHITE)
-            isChecked = prefs.overlayMode == OverlayMode.COVER
+            text = "Üstünü kapat — Eski Android / Tüm ekran (kısa gizlemeli)"
+            setTextColor(Color.parseColor("#CBD5E1"))
+            isChecked = prefs.overlayMode == OverlayMode.COVER_HIDE
         }
+        radioGroup.addView(rbCoverDirect)
         radioGroup.addView(rbAbove)
-        radioGroup.addView(rbCover)
+        radioGroup.addView(rbCoverHide)
         radioGroup.setOnCheckedChangeListener { _, checkedId ->
-            prefs.overlayMode = if (checkedId == rbCover.id) OverlayMode.COVER else OverlayMode.ABOVE
+            prefs.overlayMode = when (checkedId) {
+                rbAbove.id -> OverlayMode.ABOVE
+                rbCoverHide.id -> OverlayMode.COVER_HIDE
+                else -> OverlayMode.COVER_DIRECT
+            }
         }
         modeCard.addView(radioGroup)
+        modeCard.addView(TextView(this).apply {
+            text = "İpucu: Sıfır titremeyle PC gibi tam üstünü kapatmak için 'Oyun Üstünde Başlat' dediğinde " +
+                "çıkan Android penceresinde 'Tek bir uygulama' seçip oyununu (veya YouTube'u) seç!"
+            textSize = 12f
+            setTextColor(Color.parseColor("#94A3B8"))
+        }, marginParams(top = 8))
         root.addView(modeCard, marginParams(top = 16))
 
         // 3. Appearance & Quality Card
@@ -429,7 +447,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestScreenCapture() {
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projectionLauncher.launch(mpm.createScreenCaptureIntent())
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice())
+        } else {
+            mpm.createScreenCaptureIntent()
+        }
+        projectionLauncher.launch(intent)
     }
 
     private fun updateStartButtonState(running: Boolean) {

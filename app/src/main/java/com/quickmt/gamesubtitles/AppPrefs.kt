@@ -4,8 +4,9 @@ import android.content.Context
 import android.content.SharedPreferences
 
 enum class OverlayMode {
-    ABOVE, // Sits cleanly right above the English subtitle (zero flicker!)
-    COVER  // Covers directly on top of the English subtitle
+    COVER_DIRECT, // Covers English subtitle directly at full 250ms speed & ZERO flicker (Android 14+ Single App capture!)
+    ABOVE,        // Sits cleanly right above English subtitle at full 250ms speed & ZERO flicker (works on all Androids)
+    COVER_HIDE    // Legacy fallback: briefly hides 1 frame when capturing Entire Screen on Android <=13
 }
 
 class AppPrefs(context: Context) {
@@ -31,9 +32,10 @@ class AppPrefs(context: Context) {
 
     var overlayMode: OverlayMode
         get() = try {
-            OverlayMode.valueOf(prefs.getString("overlay_mode", OverlayMode.ABOVE.name)!!)
+            val saved = prefs.getString("overlay_mode", OverlayMode.COVER_DIRECT.name)!!
+            if (saved == "COVER") OverlayMode.COVER_DIRECT else OverlayMode.valueOf(saved)
         } catch (_: Exception) {
-            OverlayMode.ABOVE
+            OverlayMode.COVER_DIRECT
         }
         set(v) = prefs.edit().putString("overlay_mode", v.name).apply()
 

@@ -12,8 +12,8 @@ android {
         applicationId = "com.quickmt.gamesubtitles"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -27,12 +27,24 @@ android {
         }
     }
 
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("quickmt-debug.p12")
+            storeType = "PKCS12"
+            storePassword = "quickmtdebug"
+            keyAlias = "quickmt"
+            keyPassword = "quickmtdebug"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
