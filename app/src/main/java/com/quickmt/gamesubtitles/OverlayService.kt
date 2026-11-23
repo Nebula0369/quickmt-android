@@ -32,6 +32,7 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -99,6 +100,7 @@ class OverlayService : Service() {
     private var lastEnglishText = ""
     private var recentTurkish = ArrayDeque<String>()
     private var emptyStreak = 0
+    private var stableCoverChecks = 0
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -123,28 +125,51 @@ class OverlayService : Service() {
     private val scanRunnable = object : Runnable {
         override fun run() {
             if (stopped.get()) return
-            val delayMs = if (prefs.overlayMode == OverlayMode.COVER) 850L else 320L
+            val isCover = prefs.overlayMode == OverlayMode.COVER
+            val overlayShowing = subtitleView?.visibility == View.VISIBLE && lastEnglishText.isNotEmpty()
+
+            // Fast 250ms scan when no subtitle is on screen (0 flicker!);
+            // Calm adaptive interval (1.8s -> 2.3s) in COVER mode while reading a displayed subtitle!
+            val nextDelayMs = when {
+                !isCover -> 300L
+                !overlayShowing -> 250L
+                stableCoverChecks >= 1 -> (prefs.coverCheckIntervalMs + 500L).coerceAtMost(3500L)
+                else -> prefs.coverCheckIntervalMs.toLong()
+            }
+
             if (!paused.get() && !rotating.get() && pickerView == null &&
                 QuickMTNative.isInitialized && busy.compareAndSet(false, true)
             ) {
-                if (prefs.overlayMode == OverlayMode.COVER && subtitleView?.visibility == View.VISIBLE) {
-                    // Hide overlay briefly so SurfaceFlinger composites clean game frame underneath
-                    subtitleView?.visibility = View.INVISIBLE
-                    mainHandler.postDelayed({
-                        // Drain any stale frame captured before hide
-                        try {
-                            imageReader?.acquireLatestImage()?.close()
-                        } catch (_: Exception) {
+                if (isCover && overlayShowing) {
+                    // Ultra-brief GPU alpha=0 synced to Choreographer VSync (~16-32ms instead of 80ms+)
+                    val tv = subtitleView
+                    if (tv != null) {
+                        tv.alpha = 0f
+                        Choreographer.getInstance().postFrameCallback {
+                            if (stopped.get()) {
+                                busy.set(false)
+                                return@postFrameCallback
+                            }
+                            try {
+                                imageReader?.acquireLatestImage()?.close()
+                            } catch (_: Exception) {
+                            }
+                            Choreographer.getInstance().postFrameCallback {
+                                if (stopped.get()) {
+                                    busy.set(false)
+                                    return@postFrameCallback
+                                }
+                                captureAndProcess(restoreCoverAlpha = true)
+                            }
                         }
-                        mainHandler.postDelayed({
-                            captureAndProcess(restoreCoverVisibility = true)
-                        }, 40L)
-                    }, 40L)
+                    } else {
+                        captureAndProcess(restoreCoverAlpha = false)
+                    }
                 } else {
-                    captureAndProcess(restoreCoverVisibility = false)
+                    captureAndProcess(restoreCoverAlpha = false)
                 }
             }
-            mainHandler.postDelayed(this, delayMs)
+            mainHandler.postDelayed(this, nextDelayMs)
         }
     }
 
@@ -593,16 +618,15 @@ class OverlayService : Service() {
         pickerView = null
     }
 
-    private fun captureAndProcess(restoreCoverVisibility: Boolean) {
+    private fun captureAndProcess(restoreCoverAlpha: Boolean) {
         if (rotating.get() || stopped.get()) {
+            if (restoreCoverAlpha) subtitleView?.alpha = 1f
             busy.set(false)
             return
         }
         val reader = imageReader
         if (reader == null) {
-            if (restoreCoverVisibility && lastEnglishText.isNotEmpty()) {
-                subtitleView?.visibility = View.VISIBLE
-            }
+            if (restoreCoverAlpha) subtitleView?.alpha = 1f
             busy.set(false)
             return
         }
@@ -613,8 +637,9 @@ class OverlayService : Service() {
             null
         }
 
-        if (restoreCoverVisibility && lastEnglishText.isNotEmpty()) {
-            subtitleView?.visibility = View.VISIBLE
+        // Restore overlay alpha immediately after grabbing the frame (~16-32ms total hide time)
+        if (restoreCoverAlpha) {
+            subtitleView?.alpha = 1f
         }
 
         if (image == null) {
@@ -722,7 +747,9 @@ class OverlayService : Service() {
 
                 if (!isPlausibleEnglishSubtitle(rawText)) {
                     emptyStreak++
-                    if (emptyStreak >= 2 && lastEnglishText.isNotEmpty()) {
+                    stableCoverChecks = 0
+                    val clearAfter = if (prefs.overlayMode == OverlayMode.COVER) 1 else 2
+                    if (emptyStreak >= clearAfter && lastEnglishText.isNotEmpty()) {
                         lastEnglishText = ""
                         subtitleView?.visibility = View.GONE
                     }
@@ -741,11 +768,12 @@ class OverlayService : Service() {
                 if (normText.equals(lastEnglishText, ignoreCase = true) ||
                     similarity(normText, lastEnglishText) >= 0.90f
                 ) {
-                    // Still refine overlay position if subtitle moved slightly
-                    positionOverlayForRect(detectedScreenRect)
+                    stableCoverChecks++
                     busy.set(false)
                     return@addOnSuccessListener
                 }
+
+                stableCoverChecks = 0
 
                 workerExecutor.execute {
                     val (speaker, body) = if (prefs.speakerHighlight) {

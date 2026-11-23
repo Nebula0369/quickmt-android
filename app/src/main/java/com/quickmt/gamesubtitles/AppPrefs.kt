@@ -60,4 +60,9 @@ class AppPrefs(context: Context) {
     var showOriginal: Boolean
         get() = prefs.getBoolean("show_original", false)
         set(v) = prefs.edit().putBoolean("show_original", v).apply()
+
+    // In COVER mode, how often (ms) to do a 1-frame check while a subtitle is already displayed
+    var coverCheckIntervalMs: Int
+        get() = prefs.getInt("cover_check_interval_ms", 1800)
+        set(v) = prefs.edit().putInt("cover_check_interval_ms", v.coerceIn(1000, 3500)).apply()
 }

@@ -216,6 +216,26 @@ class MainActivity : AppCompatActivity() {
         optCard.addView(tvFont, marginParams(top = 10))
         optCard.addView(sbFont)
 
+        val tvCoverInterval = TextView(this).apply {
+            text = "Kapatma Modu Kontrol Aralığı: ${"%.1f".format(prefs.coverCheckIntervalMs / 1000f)} sn"
+            setTextColor(Color.parseColor("#E2E8F0"))
+        }
+        val sbCoverInterval = SeekBar(this).apply {
+            max = 25 // 1.0s .. 3.5s in 0.1s steps
+            progress = ((prefs.coverCheckIntervalMs - 1000) / 100).coerceIn(0, 25)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
+                    val ms = 1000 + p * 100
+                    prefs.coverCheckIntervalMs = ms
+                    tvCoverInterval.text = "Kapatma Modu Kontrol Aralığı: ${"%.1f".format(ms / 1000f)} sn"
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        optCard.addView(tvCoverInterval, marginParams(top = 10))
+        optCard.addView(sbCoverInterval)
+
         optCard.addView(CheckBox(this).apply {
             text = "Konuşmacı adını koru ve altın renkle vurgula (Arthur: ...)"
             setTextColor(Color.WHITE)
