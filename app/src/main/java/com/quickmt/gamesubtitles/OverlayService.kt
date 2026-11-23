@@ -14,6 +14,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
@@ -30,6 +31,7 @@ import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -54,8 +56,11 @@ class OverlayService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
 
+        private const val TAG = "QuickMTOverlay"
         private const val CHANNEL_ID = "quickmt_overlay_channel"
         private const val NOTIF_ID = 4041
+
+        private val TURKISH_ONLY_CHARS = Regex("""[ğĞşŞıİçÇöÖüÜ]""")
 
         @Volatile
         var isRunning: Boolean = false
@@ -64,6 +69,7 @@ class OverlayService : Service() {
 
     private lateinit var prefs: AppPrefs
     private lateinit var windowManager: WindowManager
+    private lateinit var displayManager: DisplayManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private val workerExecutor = Executors.newSingleThreadExecutor()
 
@@ -83,6 +89,7 @@ class OverlayService : Service() {
     private val paused = AtomicBoolean(false)
     private val busy = AtomicBoolean(false)
     private val stopped = AtomicBoolean(false)
+    private val rotating = AtomicBoolean(false)
 
     private var screenW = 1080
     private var screenH = 1920
@@ -90,6 +97,7 @@ class OverlayService : Service() {
 
     private var prevThumb: IntArray? = null
     private var lastEnglishText = ""
+    private var recentTurkish = ArrayDeque<String>()
     private var emptyStreak = 0
 
     private val projectionCallback = object : MediaProjection.Callback() {
@@ -98,17 +106,40 @@ class OverlayService : Service() {
         }
     }
 
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            scheduleDisplayResize()
+        }
+    }
+
+    private val resizeRunnable = Runnable {
+        if (!stopped.get()) {
+            applyScreenResizeIfChanged()
+        }
+    }
+
     private val scanRunnable = object : Runnable {
         override fun run() {
             if (stopped.get()) return
             val delayMs = if (prefs.overlayMode == OverlayMode.COVER) 850L else 320L
-            if (!paused.get() && pickerView == null && QuickMTNative.isInitialized && busy.compareAndSet(false, true)) {
+            if (!paused.get() && !rotating.get() && pickerView == null &&
+                QuickMTNative.isInitialized && busy.compareAndSet(false, true)
+            ) {
                 if (prefs.overlayMode == OverlayMode.COVER && subtitleView?.visibility == View.VISIBLE) {
-                    // Briefly hide overlay for 1 composite frame so MediaProjection sees the game text underneath
+                    // Hide overlay briefly so SurfaceFlinger composites clean game frame underneath
                     subtitleView?.visibility = View.INVISIBLE
                     mainHandler.postDelayed({
-                        captureAndProcess(restoreCoverVisibility = true)
-                    }, 45L)
+                        // Drain any stale frame captured before hide
+                        try {
+                            imageReader?.acquireLatestImage()?.close()
+                        } catch (_: Exception) {
+                        }
+                        mainHandler.postDelayed({
+                            captureAndProcess(restoreCoverVisibility = true)
+                        }, 40L)
+                    }, 40L)
                 } else {
                     captureAndProcess(restoreCoverVisibility = false)
                 }
@@ -123,6 +154,7 @@ class OverlayService : Service() {
         super.onCreate()
         prefs = AppPrefs(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         createNotificationChannel()
     }
 
@@ -154,8 +186,8 @@ class OverlayService : Service() {
         setupMediaProjection(resultCode, resultData)
         createSubtitleOverlay()
         createControlPill()
+        displayManager.registerDisplayListener(displayListener, mainHandler)
 
-        // Ensure native QuickMT model is loaded on background thread
         if (!QuickMTNative.isInitialized && ModelDownloader.isModelReady(this)) {
             workerExecutor.execute {
                 QuickMTNative.init(ModelDownloader.getModelDir(this), threads = 4)
@@ -169,10 +201,65 @@ class OverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        scheduleDisplayResize()
+    }
+
+    private fun scheduleDisplayResize() {
+        mainHandler.removeCallbacks(resizeRunnable)
+        mainHandler.postDelayed(resizeRunnable, 140L)
+    }
+
+    /**
+     * Android 14+ safe orientation resize!
+     * NEVER calls mediaProjection.createVirtualDisplay() a second time (which crashes on Android 14+).
+     * Instead uses virtualDisplay.resize() + virtualDisplay.setSurface(newReader.surface).
+     */
+    @SuppressLint("WrongConstant")
+    private fun applyScreenResizeIfChanged() {
+        val oldW = screenW
+        val oldH = screenH
         updateScreenMetrics()
-        recreateVirtualDisplay()
-        updateSubtitlePosition()
-        prevThumb = null
+        if (screenW == oldW && screenH == oldH) return
+
+        rotating.set(true)
+        try {
+            val vd = virtualDisplay
+            if (vd != null) {
+                val oldReader = imageReader
+                // Detach surface BEFORE closing old ImageReader to avoid SurfaceFlinger error
+                vd.setSurface(null)
+                val newReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
+                vd.resize(screenW, screenH, screenDpi)
+                vd.setSurface(newReader.surface)
+                imageReader = newReader
+                try {
+                    oldReader?.close()
+                } catch (_: Exception) {
+                }
+            }
+
+            // Clamp floating control pill inside new landscape/portrait screen bounds
+            pillParams?.let { lp ->
+                lp.x = lp.x.coerceIn(12, max(12, screenW - 180))
+                lp.y = lp.y.coerceIn(24, max(24, screenH - 120))
+                pillView?.let { v ->
+                    try {
+                        windowManager.updateViewLayout(v, lp)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+
+            // Reset OCR cache and hide stale subtitle until next scan in new orientation
+            prevThumb = null
+            lastEnglishText = ""
+            subtitleView?.visibility = View.GONE
+            positionOverlayToScanZone()
+        } catch (ex: Exception) {
+            Log.e(TAG, "Error resizing VirtualDisplay on rotation", ex)
+        } finally {
+            rotating.set(false)
+        }
     }
 
     private fun startAsForeground() {
@@ -217,19 +304,20 @@ class OverlayService : Service() {
     private fun updateScreenMetrics() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val bounds = windowManager.maximumWindowMetrics.bounds
-            screenW = bounds.width()
-            screenH = bounds.height()
+            screenW = max(1, bounds.width())
+            screenH = max(1, bounds.height())
             screenDpi = resources.displayMetrics.densityDpi
         } else {
             val dm = DisplayMetrics()
             @Suppress("DEPRECATION")
             windowManager.defaultDisplay.getRealMetrics(dm)
-            screenW = dm.widthPixels
-            screenH = dm.heightPixels
+            screenW = max(1, dm.widthPixels)
+            screenH = max(1, dm.heightPixels)
             screenDpi = dm.densityDpi
         }
     }
 
+    @SuppressLint("WrongConstant")
     private fun setupMediaProjection(resultCode: Int, data: Intent) {
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val mp = mpm.getMediaProjection(resultCode, data) ?: run {
@@ -238,17 +326,10 @@ class OverlayService : Service() {
         }
         mp.registerCallback(projectionCallback, mainHandler)
         mediaProjection = mp
-        recreateVirtualDisplay()
-    }
-
-    @SuppressLint("WrongConstant")
-    private fun recreateVirtualDisplay() {
-        virtualDisplay?.release()
-        imageReader?.close()
 
         val reader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
         imageReader = reader
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
+        virtualDisplay = mp.createVirtualDisplay(
             "QuickMTGameCapture",
             screenW,
             screenH,
@@ -260,16 +341,26 @@ class OverlayService : Service() {
         )
     }
 
+    private fun applyFullScreenCutoutMode(lp: WindowManager.LayoutParams) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            lp.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lp.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+    }
+
     private fun createSubtitleOverlay() {
         val tv = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = prefs.fontSizeSp.toFloat()
             gravity = Gravity.CENTER
-            setPadding(28, 16, 28, 16)
+            setPadding(28, 14, 28, 14)
             setShadowLayer(4f, 1f, 2f, Color.BLACK)
             background = GradientDrawable().apply {
                 setColor(Color.argb(prefs.overlayOpacity, 10, 12, 18))
-                cornerRadius = 20f
+                cornerRadius = 18f
             }
             visibility = View.GONE
         }
@@ -280,49 +371,85 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            applyFullScreenCutoutMode(this)
         }
 
         subtitleView = tv
         subtitleParams = lp
         windowManager.addView(tv, lp)
-        updateSubtitlePosition()
+        positionOverlayToScanZone()
     }
 
-    private fun updateSubtitlePosition() {
-        val tv = subtitleView ?: return
-        val lp = subtitleParams ?: return
-
+    private fun positionOverlayToScanZone() {
         val regLeft = (prefs.regionLeft * screenW).toInt()
         val regTop = (prefs.regionTop * screenH).toInt()
         val regRight = (prefs.regionRight * screenW).toInt()
         val regBottom = (prefs.regionBottom * screenH).toInt()
-        val regW = max(240, regRight - regLeft)
-        val regH = max(70, regBottom - regTop)
+        positionOverlayForRect(Rect(regLeft, regTop, max(regLeft + 120, regRight), max(regTop + 40, regBottom)))
+    }
+
+    /**
+     * Positions the dark Turkish overlay box pixel-accurately relative to the EXACT
+     * detected English subtitle bounding box in full raw display coordinates (0,0 = true top-left).
+     */
+    private fun positionOverlayForRect(detectedRect: Rect) {
+        val tv = subtitleView ?: return
+        val lp = subtitleParams ?: return
 
         tv.textSize = prefs.fontSizeSp.toFloat()
         (tv.background as? GradientDrawable)?.setColor(
             Color.argb(prefs.overlayOpacity, 10, 12, 18)
         )
 
+        val regW = max(240, ((prefs.regionRight - prefs.regionLeft) * screenW).toInt())
+        val padX = 28
+        val padY = 14
+
+        // Compute ideal width: covers the English text + padding, wider if Turkish needs more room
+        val minCoverW = detectedRect.width() + padX * 2
+        val maxAllowedW = min(screenW - 24, max(regW, minCoverW))
+
+        tv.measure(
+            View.MeasureSpec.makeMeasureSpec(maxAllowedW, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(screenH / 2, View.MeasureSpec.AT_MOST)
+        )
+        val targetW = max(minCoverW, tv.measuredWidth).coerceIn(180, maxAllowedW)
+
+        // Re-measure exact height at final targetW
+        tv.measure(
+            View.MeasureSpec.makeMeasureSpec(targetW, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(screenH / 2, View.MeasureSpec.AT_MOST)
+        )
+        val measuredH = max(48, tv.measuredHeight)
+
+        // Center horizontally directly on the detected English subtitle center
+        val centerX = detectedRect.centerX()
+        val x = (centerX - targetW / 2).coerceIn(12, max(12, screenW - targetW - 12))
+
         if (prefs.overlayMode == OverlayMode.COVER) {
-            lp.x = regLeft
-            lp.y = regTop
-            lp.width = regW
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT
-            tv.minHeight = regH
+            val coverH = max(detectedRect.height() + padY * 2, measuredH)
+            val centerY = detectedRect.centerY()
+            val y = (centerY - coverH / 2).coerceIn(12, max(12, screenH - coverH - 12))
+            lp.x = x
+            lp.y = y
+            lp.width = targetW
+            lp.height = coverH
+            tv.minHeight = coverH
         } else {
-            // ABOVE mode: sits cleanly right above the English subtitle region with ZERO overlap
-            lp.width = regW
+            // ABOVE mode: bottom edge sits cleanly 10px directly above the detected English text!
+            val y = (detectedRect.top - measuredH - 10).coerceIn(12, max(12, screenH - measuredH - 12))
+            lp.x = x
+            lp.y = y
+            lp.width = targetW
             lp.height = WindowManager.LayoutParams.WRAP_CONTENT
             tv.minHeight = 0
-            lp.x = regLeft
-            val approxH = max(90, (prefs.fontSizeSp * resources.displayMetrics.scaledDensity * 2.8f).toInt())
-            lp.y = max(20, regTop - approxH - 10)
         }
+
         try {
             windowManager.updateViewLayout(tv, lp)
         } catch (_: Exception) {
@@ -383,7 +510,6 @@ class OverlayService : Service() {
             y = 140
         }
 
-        // Allow dragging the floating control pill anywhere on screen
         var initX = 0
         var initY = 0
         var touchX = 0f
@@ -401,9 +527,12 @@ class OverlayService : Service() {
                     val dx = (ev.rawX - touchX).toInt()
                     val dy = (ev.rawY - touchY).toInt()
                     if (abs(dx) > 10 || abs(dy) > 10) {
-                        lp.x = initX + dx
-                        lp.y = initY + dy
-                        windowManager.updateViewLayout(pill, lp)
+                        lp.x = (initX + dx).coerceIn(0, max(0, screenW - 120))
+                        lp.y = (initY + dy).coerceIn(0, max(0, screenH - 80))
+                        try {
+                            windowManager.updateViewLayout(pill, lp)
+                        } catch (_: Exception) {
+                        }
                         true
                     } else false
                 }
@@ -432,20 +561,24 @@ class OverlayService : Service() {
                 prefs.regionRight = r
                 prefs.regionBottom = b
                 closeRegionPicker()
-                updateSubtitlePosition()
+                positionOverlayToScanZone()
                 prevThumb = null
                 lastEnglishText = ""
             },
             onCancel = { closeRegionPicker() }
         )
 
+        // Exact full raw display coordinates (matching ImageReader 1:1 across notches & status bar!)
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        )
+        ).apply {
+            applyFullScreenCutoutMode(this)
+        }
         pickerView = picker
         windowManager.addView(picker, lp)
     }
@@ -461,6 +594,10 @@ class OverlayService : Service() {
     }
 
     private fun captureAndProcess(restoreCoverVisibility: Boolean) {
+        if (rotating.get() || stopped.get()) {
+            busy.set(false)
+            return
+        }
         val reader = imageReader
         if (reader == null) {
             if (restoreCoverVisibility && lastEnglishText.isNotEmpty()) {
@@ -485,28 +622,35 @@ class OverlayService : Service() {
             return
         }
 
+        var cropX = 0
+        var cropY = 0
+        var imgW = 1
+        var imgH = 1
+
         val cropBitmap: Bitmap? = try {
+            imgW = image.width
+            imgH = image.height
             val plane = image.planes[0]
             val buffer = plane.buffer
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
-            val rowPadding = rowStride - pixelStride * image.width
+            val rowPadding = rowStride - pixelStride * imgW
 
             val full = Bitmap.createBitmap(
-                image.width + rowPadding / pixelStride,
-                image.height,
+                imgW + rowPadding / pixelStride,
+                imgH,
                 Bitmap.Config.ARGB_8888
             )
             full.copyPixelsFromBuffer(buffer)
 
-            val x = (prefs.regionLeft * image.width).toInt().coerceIn(0, image.width - 20)
-            val y = (prefs.regionTop * image.height).toInt().coerceIn(0, image.height - 20)
-            val w = ((prefs.regionRight - prefs.regionLeft) * image.width).toInt()
-                .coerceIn(20, image.width - x)
-            val h = ((prefs.regionBottom - prefs.regionTop) * image.height).toInt()
-                .coerceIn(20, image.height - y)
+            cropX = (prefs.regionLeft * imgW).toInt().coerceIn(0, max(0, imgW - 20))
+            cropY = (prefs.regionTop * imgH).toInt().coerceIn(0, max(0, imgH - 20))
+            val cropW = ((prefs.regionRight - prefs.regionLeft) * imgW).toInt()
+                .coerceIn(20, max(20, imgW - cropX))
+            val cropH = ((prefs.regionBottom - prefs.regionTop) * imgH).toInt()
+                .coerceIn(20, max(20, imgH - cropY))
 
-            val cropped = Bitmap.createBitmap(full, x, y, w, h)
+            val cropped = Bitmap.createBitmap(full, cropX, cropY, cropW, cropH)
             full.recycle()
             cropped
         } catch (_: Exception) {
@@ -520,14 +664,12 @@ class OverlayService : Service() {
             return
         }
 
-        // Fast downsampled pixel-diff filter to save CPU & battery when subtitles are static
         val thumb = computeThumb(cropBitmap)
         val prev = prevThumb
         if (prev != null && prev.size == thumb.size) {
             var diffSum = 0L
             for (i in thumb.indices) diffSum += abs(thumb[i] - prev[i])
-            val meanDiff = diffSum.toFloat() / thumb.size
-            if (meanDiff < 3.5f) {
+            if (diffSum.toFloat() / thumb.size < 3.5f) {
                 cropBitmap.recycle()
                 busy.set(false)
                 return
@@ -535,14 +677,46 @@ class OverlayService : Service() {
         }
         prevThumb = thumb
 
+        val scaleX = screenW.toFloat() / max(1, imgW)
+        val scaleY = screenH.toFloat() / max(1, imgH)
+
         val inputImage = InputImage.fromBitmap(cropBitmap, 0)
         textRecognizer.process(inputImage)
             .addOnSuccessListener { visionText ->
-                val rawText = visionText.textBlocks
-                    .sortedBy { it.boundingBox?.top ?: 0 }
+                val blocks = visionText.textBlocks.sortedBy { it.boundingBox?.top ?: 0 }
+                val rawText = blocks
                     .joinToString(" ") { it.text.replace('\n', ' ') }
                     .replace(Regex("""\s+"""), " ")
                     .trim()
+
+                // Compute exact union bounding box of the detected English text in screen pixels
+                var minX = Int.MAX_VALUE
+                var minY = Int.MAX_VALUE
+                var maxX = Int.MIN_VALUE
+                var maxY = Int.MIN_VALUE
+                for (b in blocks) {
+                    val box = b.boundingBox ?: continue
+                    minX = min(minX, box.left)
+                    minY = min(minY, box.top)
+                    maxX = max(maxX, box.right)
+                    maxY = max(maxY, box.bottom)
+                }
+
+                val detectedScreenRect = if (minX < maxX && minY < maxY) {
+                    Rect(
+                        ((cropX + minX) * scaleX).toInt(),
+                        ((cropY + minY) * scaleY).toInt(),
+                        ((cropX + maxX) * scaleX).toInt(),
+                        ((cropY + maxY) * scaleY).toInt()
+                    )
+                } else {
+                    Rect(
+                        (prefs.regionLeft * screenW).toInt(),
+                        (prefs.regionTop * screenH).toInt(),
+                        (prefs.regionRight * screenW).toInt(),
+                        (prefs.regionBottom * screenH).toInt()
+                    )
+                }
 
                 cropBitmap.recycle()
 
@@ -556,11 +730,19 @@ class OverlayService : Service() {
                     return@addOnSuccessListener
                 }
 
+                // Prevent translating our own Turkish subtitle if a stale frame ever slips through
+                if (isSelfEcho(rawText)) {
+                    busy.set(false)
+                    return@addOnSuccessListener
+                }
+
                 emptyStreak = 0
                 val normText = QuickMTNative.normalizeOcrEnglish(rawText)
                 if (normText.equals(lastEnglishText, ignoreCase = true) ||
                     similarity(normText, lastEnglishText) >= 0.90f
                 ) {
+                    // Still refine overlay position if subtitle moved slightly
+                    positionOverlayForRect(detectedScreenRect)
                     busy.set(false)
                     return@addOnSuccessListener
                 }
@@ -579,7 +761,10 @@ class OverlayService : Service() {
                     mainHandler.post {
                         if (!stopped.get() && translated.isNotEmpty()) {
                             lastEnglishText = normText
-                            renderSubtitle(speaker, translated, normText)
+                            recentTurkish.addLast(translated)
+                            if (speaker.isNotEmpty()) recentTurkish.addLast("$speaker: $translated")
+                            while (recentTurkish.size > 6) recentTurkish.removeFirst()
+                            renderSubtitle(speaker, translated, normText, detectedScreenRect)
                         }
                         busy.set(false)
                     }
@@ -591,7 +776,12 @@ class OverlayService : Service() {
             }
     }
 
-    private fun renderSubtitle(speaker: String, translated: String, original: String) {
+    private fun renderSubtitle(
+        speaker: String,
+        translated: String,
+        original: String,
+        detectedScreenRect: Rect
+    ) {
         val tv = subtitleView ?: return
         val sb = SpannableStringBuilder()
         if (prefs.showOriginal && original.isNotEmpty()) {
@@ -622,8 +812,24 @@ class OverlayService : Service() {
         }
         sb.append(translated)
         tv.text = sb
-        updateSubtitlePosition()
+        positionOverlayForRect(detectedScreenRect)
         tv.visibility = View.VISIBLE
+    }
+
+    private fun isSelfEcho(detected: String): Boolean {
+        val normDet = detected.lowercase().replace(Regex("""[^\w\s]"""), " ")
+            .replace(Regex("""\s+"""), " ").trim()
+        if (normDet.isEmpty()) return false
+        for (prev in recentTurkish) {
+            val normPrev = prev.lowercase().replace(Regex("""[^\w\s]"""), " ")
+                .replace(Regex("""\s+"""), " ").trim()
+            if (normPrev.length >= 4 &&
+                (normDet.contains(normPrev) || similarity(normDet, normPrev) >= 0.72f)
+            ) {
+                return true
+            }
+        }
+        return TURKISH_ONLY_CHARS.findAll(detected).count() >= 2
     }
 
     private fun computeThumb(bmp: Bitmap): IntArray {
@@ -665,6 +871,10 @@ class OverlayService : Service() {
         stopped.set(true)
         isRunning = false
         mainHandler.removeCallbacksAndMessages(null)
+        try {
+            displayManager.unregisterDisplayListener(displayListener)
+        } catch (_: Exception) {
+        }
         closeRegionPicker()
         subtitleView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
         pillView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
