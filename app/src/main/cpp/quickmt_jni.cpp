@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "ctranslate2/models/model_loader.h"
+#include "ctranslate2/models/model.h"
 #include "ctranslate2/replica_pool.h"
 #include "ctranslate2/translator.h"
 #include "sentencepiece_processor.h"

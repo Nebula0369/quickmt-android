@@ -81,6 +81,9 @@ jobs:
 
           echo "=== Building CTranslate2 (${CT2_TAG}) for arm64-v8a (WITH_RUY=ON) ==="
           git clone --depth 1 --branch "${CT2_TAG}" --recursive https://github.com/OpenNMT/CTranslate2.git "${WORK_ROOT}/CTranslate2"
+          # Android Bionic does not provide pthread_setaffinity_np
+          sed -i 's/#if !defined(__linux__) || defined(_OPENMP)/#if !defined(__linux__) || defined(__ANDROID__) || defined(_OPENMP)/' \
+            "${WORK_ROOT}/CTranslate2/src/thread_pool.cc"
           "${CMAKE_BIN}" -G Ninja \
             -S "${WORK_ROOT}/CTranslate2" \
             -B "${WORK_ROOT}/build-ct2" \
