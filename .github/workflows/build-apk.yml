@@ -57,7 +57,7 @@ jobs:
           mkdir -p "${WORK_ROOT}" "${THIRD_PARTY}/ctranslate2" "${THIRD_PARTY}/sentencepiece" \
                    "${GITHUB_WORKSPACE}/app/src/main/jniLibs/arm64-v8a"
 
-          echo "=== Building SentencePiece (${SPM_TAG}) for arm64-v8a ==="
+          echo "=== Building SentencePiece (${SPM_TAG}) static lib for arm64-v8a ==="
           git clone --depth 1 --branch "${SPM_TAG}" https://github.com/google/sentencepiece.git "${WORK_ROOT}/sentencepiece"
           "${CMAKE_BIN}" -G Ninja \
             -S "${WORK_ROOT}/sentencepiece" \
@@ -68,12 +68,16 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_shared \
+            -DCMAKE_EXE_LINKER_FLAGS="-llog" \
             -DSPM_ENABLE_SHARED=OFF \
             -DSPM_BUILD_TEST=OFF \
             -DSPM_ENABLE_TCMALLOC=OFF \
             -DCMAKE_INSTALL_LIBDIR=lib \
             -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY}/sentencepiece"
-          "${CMAKE_BIN}" --build "${WORK_ROOT}/build-spm" --target install -j "$(nproc)"
+          "${CMAKE_BIN}" --build "${WORK_ROOT}/build-spm" --target sentencepiece-static -j "$(nproc)"
+          mkdir -p "${THIRD_PARTY}/sentencepiece/lib" "${THIRD_PARTY}/sentencepiece/include"
+          cp "${WORK_ROOT}/build-spm/src/libsentencepiece.a" "${THIRD_PARTY}/sentencepiece/lib/"
+          cp "${WORK_ROOT}/sentencepiece/src/sentencepiece_processor.h" "${THIRD_PARTY}/sentencepiece/include/"
 
           echo "=== Building CTranslate2 (${CT2_TAG}) for arm64-v8a (WITH_RUY=ON) ==="
           git clone --depth 1 --branch "${CT2_TAG}" --recursive https://github.com/OpenNMT/CTranslate2.git "${WORK_ROOT}/CTranslate2"

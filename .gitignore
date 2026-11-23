@@ -12,3 +12,4 @@ app/src/main/jniLibs/
 app/src/main/cpp/third_party/
 *.apk
 *.aab
+GITHUB_YUKLE.bat
