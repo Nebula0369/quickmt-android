@@ -1,0 +1,124 @@
+name: Build QuickMT Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: "26.3.11579264"
+  CMAKE_VERSION: "3.22.1"
+  CT2_TAG: "v4.5.0"
+  SPM_TAG: "v0.2.0"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components (NDK + CMake + Platform 34)
+        run: |
+          (yes || true) | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+
+      - name: Cache compiled CTranslate2 & SentencePiece (arm64-v8a)
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/src/main/cpp/third_party
+            app/src/main/jniLibs/arm64-v8a/libctranslate2.so
+          key: native-arm64-${{ env.NDK_VERSION }}-${{ env.CT2_TAG }}-${{ env.SPM_TAG }}-v1
+
+      - name: Cross-compile CTranslate2 & SentencePiece for Android arm64-v8a
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          export CMAKE_BIN="${ANDROID_HOME}/cmake/${CMAKE_VERSION}/bin/cmake"
+          export NINJA_BIN="${ANDROID_HOME}/cmake/${CMAKE_VERSION}/bin/ninja"
+          export WORK_ROOT="${RUNNER_TEMP}/native_build"
+          export THIRD_PARTY="${GITHUB_WORKSPACE}/app/src/main/cpp/third_party"
+          mkdir -p "${WORK_ROOT}" "${THIRD_PARTY}/ctranslate2" "${THIRD_PARTY}/sentencepiece" \
+                   "${GITHUB_WORKSPACE}/app/src/main/jniLibs/arm64-v8a"
+
+          echo "=== Building SentencePiece (${SPM_TAG}) for arm64-v8a ==="
+          git clone --depth 1 --branch "${SPM_TAG}" https://github.com/google/sentencepiece.git "${WORK_ROOT}/sentencepiece"
+          "${CMAKE_BIN}" -G Ninja \
+            -S "${WORK_ROOT}/sentencepiece" \
+            -B "${WORK_ROOT}/build-spm" \
+            -DCMAKE_MAKE_PROGRAM="${NINJA_BIN}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_shared \
+            -DSPM_ENABLE_SHARED=OFF \
+            -DSPM_BUILD_TEST=OFF \
+            -DSPM_ENABLE_TCMALLOC=OFF \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY}/sentencepiece"
+          "${CMAKE_BIN}" --build "${WORK_ROOT}/build-spm" --target install -j "$(nproc)"
+
+          echo "=== Building CTranslate2 (${CT2_TAG}) for arm64-v8a (WITH_RUY=ON) ==="
+          git clone --depth 1 --branch "${CT2_TAG}" --recursive https://github.com/OpenNMT/CTranslate2.git "${WORK_ROOT}/CTranslate2"
+          "${CMAKE_BIN}" -G Ninja \
+            -S "${WORK_ROOT}/CTranslate2" \
+            -B "${WORK_ROOT}/build-ct2" \
+            -DCMAKE_MAKE_PROGRAM="${NINJA_BIN}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_shared \
+            -DWITH_MKL=OFF \
+            -DWITH_DNNL=OFF \
+            -DWITH_OPENBLAS=OFF \
+            -DWITH_RUY=ON \
+            -DOPENMP_RUNTIME=NONE \
+            -DENABLE_CPU_DISPATCH=OFF \
+            -DBUILD_CLI=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY}/ctranslate2"
+          "${CMAKE_BIN}" --build "${WORK_ROOT}/build-ct2" --target install -j "$(nproc)"
+
+          CT2_SO="$(find "${THIRD_PARTY}/ctranslate2" -name "libctranslate2.so" | head -n 1)"
+          cp "${CT2_SO}" "${GITHUB_WORKSPACE}/app/src/main/jniLibs/arm64-v8a/libctranslate2.so"
+
+          echo "Native libraries ready:"
+          ls -lh "${GITHUB_WORKSPACE}/app/src/main/jniLibs/arm64-v8a/libctranslate2.so"
+          ls -lh "${THIRD_PARTY}/sentencepiece/lib/"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build Android APK
+        run: |
+          gradle assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk QuickMT-Game-Subtitles-arm64.apk
+          ls -lh QuickMT-Game-Subtitles-arm64.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickMT-Game-Subtitles-arm64-APK
+          path: QuickMT-Game-Subtitles-arm64.apk
+          retention-days: 30
